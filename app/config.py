@@ -41,9 +41,18 @@ PLAYBOOK_ANSWER_MAX_CHARS = int(os.getenv("PLAYBOOK_ANSWER_MAX_CHARS", "80"))
 # 注入策略(note)的最大字符数:策略保留但也不许超长,超出截断
 PLAYBOOK_NOTE_MAX_CHARS = int(os.getenv("PLAYBOOK_NOTE_MAX_CHARS", "60"))
 
+# ---- 自学习验收(双闸 / 回滚 / 台账) ----
+# 双闸开关:新学样本是否必须先过验证再由店长确认才生效。
+# 0(默认):人工在后台教的即时生效,保持原有体验;自学习脚本自己显式传 pending。
+# 1:所有新样本一律先进待验证区,后台点「确认生效」后才参与召回。
+PLAYBOOK_REQUIRE_APPROVAL = os.getenv("PLAYBOOK_REQUIRE_APPROVAL", "0") == "1"
+
+# 验收闸门:综合分相比上一轮最多允许跌多少。超过即判 regress,
+# 这批样本拒绝生效(甚至自动回滚),宁可回到旧状态也不让线上变差。
+EVAL_REGRESS_TOLERANCE = float(os.getenv("EVAL_REGRESS_TOLERANCE", "0.05"))
+
 # 选用的 LLM 提供方:mock(离线桩)| ark(真实豆包/火山引擎 ARK)
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "mock")
-
 # 豆包(火山引擎 ARK)配置,OpenAI 兼容接口
 ARK_API_KEY = os.getenv("ARK_API_KEY", "")
 ARK_BASE_URL = os.getenv("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")

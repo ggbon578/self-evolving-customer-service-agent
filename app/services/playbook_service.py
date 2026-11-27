@@ -14,32 +14,79 @@ from ..knowledge import embedder
 
 
 def add_sample(question: str, answer: str, note: str = "",
-               source: str = "taught") -> int:
+               source: str = "taught", status: str | None = None,
+               batch_id: str | None = None) -> int:
+    """写入一条训练样本。
+
+    status='pending' 用于自学习通道:先进待验证区,跑分通过 + 店长确认后才生效,
+    避免模型/脚本自己「学歪」的东西直接污染线上召回。
+    status 不传时按配置决定:默认即时生效(保持人工教学的原有体验)。
+    """
+    if status is None:
+        status = "pending" if config.PLAYBOOK_REQUIRE_APPROVAL else "active"
     vector, sig = embedder.embed(question)
     with cursor() as cur:
         cur.execute(
-            "INSERT INTO playbook (question, answer, note, source, vector, vec_model) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (question, answer, note, source, json.dumps(vector), sig),
+            "INSERT INTO playbook (question, answer, note, source, vector, vec_model, status, batch_id, activated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ?='active' THEN datetime('now','localtime') ELSE NULL END)",
+            (question, answer, note, source, json.dumps(vector), sig, status, batch_id, status),
         )
         return cur.lastrowid
 
 
-def list_samples(source: str | None = None) -> list[dict[str, Any]]:
-    """列出训练样本;传入 source 时只返回该来源
-    (taught 对话教学 / refine 实测纠偏 / ticket 工单补充)。"""
+def list_samples(source: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
+    """列出训练样本;可叠加 source(taught/refine/ticket)与 status(active/pending/rolled_back)过滤。"""
+    sql = "SELECT * FROM playbook"
+    where, args = [], []
+    if source:
+        where.append("source=?")
+        args.append(source)
+    if status:
+        where.append("status=?")
+        args.append(status)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id DESC"
     with cursor() as cur:
-        if source:
-            cur.execute("SELECT * FROM playbook WHERE source=? ORDER BY id DESC", (source,))
-        else:
-            cur.execute("SELECT * FROM playbook ORDER BY id DESC")
+        cur.execute(sql, tuple(args))
         return [dict(r) for r in cur.fetchall()]
 
 
+# 验收「影子放行」:跑分时需要先看这批候选样本进来后会怎样,但此时它们还没转正。
+# 用进程内集合临时放行,不改库状态——线上召回照旧,跑完 finally 清掉。
+# 这样既能测出"学了会变好还是变坏",又不会在验收期间把未验证的东西真的推给客户。
+_EXTRA_ACTIVE_BATCHES: set[str] = set()
+
+
+def shadow_allow(batch_id: str) -> None:
+    _EXTRA_ACTIVE_BATCHES.add(batch_id)
+
+
+def shadow_clear() -> None:
+    _EXTRA_ACTIVE_BATCHES.clear()
+
+
+def _active_cond() -> tuple[str, tuple]:
+    """召回用的生效条件;有影子批次时一并放行(仅当前进程)。"""
+    batches = sorted(_EXTRA_ACTIVE_BATCHES)
+    if not batches:
+        return "status='active'", ()
+    placeholders = ",".join("?" * len(batches))
+    return f"(status='active' OR batch_id IN ({placeholders}))", tuple(batches)
+
+
 def recall_all() -> list[dict[str, Any]]:
-    """召回全部样本(供总纲归纳用,需要看到所有示范)。"""
+    """召回全部【已生效】样本(供总纲归纳用)。
+
+    只取 active:待验证/已回滚的样本不该影响总纲,否则双闸形同虚设。
+    验收时若开了影子放行,该批次也会被计入——测的就是"加上它之后的效果"。
+    """
+    cond, args = _active_cond()
     with cursor() as cur:
-        cur.execute("SELECT id, question, answer, note FROM playbook ORDER BY id")
+        cur.execute(
+            f"SELECT id, question, answer, note FROM playbook WHERE {cond} ORDER BY id",
+            args,
+        )
         return [dict(r) for r in cur.fetchall()]
 
 
@@ -62,8 +109,13 @@ def recall_topk(query: str, k: int) -> list[dict[str, Any]]:
 
     query 为空时退化为全量返回,避免空检索导致答不上。
     """
+    cond, args = _active_cond()
     with cursor() as cur:
-        cur.execute("SELECT id, question, answer, note, vector, vec_model FROM playbook ORDER BY id")
+        cur.execute(
+            f"SELECT id, question, answer, note, vector, vec_model FROM playbook "
+            f"WHERE {cond} ORDER BY id",
+            args,
+        )
         rows = [dict(r) for r in cur.fetchall()]
     if not rows:
         return []
@@ -125,3 +177,73 @@ def count() -> int:
     with cursor() as cur:
         cur.execute("SELECT COUNT(*) AS c FROM playbook")
         return cur.fetchone()["c"]
+
+
+def count_active() -> int:
+    """已生效(会被召回)的样本数——双闸后的真实知识量。"""
+    with cursor() as cur:
+        cur.execute("SELECT COUNT(*) AS c FROM playbook WHERE status='active'")
+        return cur.fetchone()["c"]
+
+
+# ---------- 双闸:待验证 → 确认生效 / 整体回滚 ----------
+
+def activate_sample(sample_id: int) -> dict[str, Any]:
+    """第二道闸:店长确认后,把单条待验证样本转正。"""
+    with cursor() as cur:
+        cur.execute(
+            "UPDATE playbook SET status='active', activated_at=datetime('now','localtime') "
+            "WHERE id=? AND status='pending'",
+            (sample_id,),
+        )
+        changed = cur.rowcount
+    return {"ok": bool(changed), "sample_id": sample_id, "changed": changed}
+
+
+def activate_batch(batch_id: str, note: str = "") -> dict[str, Any]:
+    """整批转正:一次学习产出的所有样本同时生效。"""
+    with cursor() as cur:
+        cur.execute(
+            "UPDATE playbook SET status='active', activated_at=datetime('now','localtime') "
+            "WHERE batch_id=? AND status='pending'",
+            (batch_id,),
+        )
+        changed = cur.rowcount
+    return {"ok": bool(changed), "batch_id": batch_id, "changed": changed, "note": note}
+
+
+def rollback_batch(batch_id: str, reason: str = "manual") -> dict[str, Any]:
+    """一键回滚:把某一批次学到的样本全部作废(置 rolled_back,不物理删除)。
+
+    保留数据便于事后复盘「这批到底学了什么、为什么回滚」;
+    召回只认 status='active',所以置位后立刻从线上消失。
+    """
+    with cursor() as cur:
+        cur.execute(
+            "UPDATE playbook SET status='rolled_back' WHERE batch_id=? AND status IN ('active','pending')",
+            (batch_id,),
+        )
+        changed = cur.rowcount
+    return {"ok": bool(changed), "batch_id": batch_id, "rolled_back": changed, "reason": reason}
+
+
+def pending_samples(batch_id: str | None = None) -> list[dict[str, Any]]:
+    """待验证区样本(给后台「待确认」列表用)。"""
+    sql = "SELECT id, question, answer, note, source, batch_id, created_at FROM playbook WHERE status='pending'"
+    args: tuple = ()
+    if batch_id:
+        sql += " AND batch_id=?"
+        args = (batch_id,)
+    with cursor() as cur:
+        cur.execute(sql + " ORDER BY id DESC", args)
+        return [dict(r) for r in cur.fetchall()]
+
+
+def batches() -> list[dict[str, Any]]:
+    """批次一览:每批多少条、什么状态,便于逐批验收/回滚。"""
+    with cursor() as cur:
+        cur.execute(
+            "SELECT batch_id, status, COUNT(*) AS n, MIN(created_at) AS created_at "
+            "FROM playbook WHERE batch_id IS NOT NULL GROUP BY batch_id, status ORDER BY batch_id DESC"
+        )
+        return [dict(r) for r in cur.fetchall()]

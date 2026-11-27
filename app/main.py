@@ -6,6 +6,7 @@ import os
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from . import config
 from .db import init_db
@@ -216,6 +217,64 @@ def get_system_prompt() -> dict:
 @app.get("/api/metrics")
 def get_metrics() -> dict:
     return review_service.metrics()
+
+
+# ---------- 自学习验收(双闸 / 回滚 / 台账) ----------
+
+class EvalRequest(BaseModel):
+    batch_id: str | None = None
+    limit: int | None = None
+    note: str = ""
+
+
+@app.get("/api/learn/pending")
+def learn_pending(batch_id: str | None = None) -> list[dict]:
+    """待验证区:学过但还没生效的样本。"""
+    return playbook_service.pending_samples(batch_id)
+
+
+@app.get("/api/learn/batches")
+def learn_batches() -> list[dict]:
+    """学习批次一览(这批多少条、什么状态)。"""
+    return playbook_service.batches()
+
+
+@app.get("/api/learn/approved-count")
+def learn_approved_count() -> dict:
+    """已生效样本数(双闸口径);与 /api/metrics 的 kb_count 对齐校验用。"""
+    return {"active": playbook_service.count_active()}
+
+
+@app.post("/api/learn/sample/{sample_id}/activate")
+def learn_activate(sample_id: int) -> dict:
+    """第二道闸:店长逐条确认生效。"""
+    return playbook_service.activate_sample(sample_id)
+
+
+@app.post("/api/learn/batch/{batch_id}/activate")
+def learn_activate_batch(batch_id: str) -> dict:
+    return playbook_service.activate_batch(batch_id, note="manual")
+
+
+@app.post("/api/learn/batch/{batch_id}/rollback")
+def learn_rollback(batch_id: str) -> dict:
+    """一键回滚:整批样本立即从召回中消失(数据保留可复盘)。"""
+    return playbook_service.rollback_batch(batch_id, reason="manual")
+
+
+@app.post("/api/eval/run")
+def eval_run(req: EvalRequest) -> dict:
+    """在后台点一下就跑一遍 20 题验收。注意:真实模型约 1~3 分钟。"""
+    from .services import eval_service
+    result = eval_service.run_eval(batch_id=req.batch_id, note=req.note, limit=req.limit)
+    # 明细里的 reply 很长,接口只回汇总,明细去 /api/eval/history 或用 CLI 导出
+    return {k: v for k, v in result.items() if k != "rows"}
+
+
+@app.get("/api/eval/history")
+def eval_history(limit: int = 20) -> list[dict]:
+    from .services import eval_service
+    return eval_service.history(limit)
 
 
 # ---------- 前端 ----------

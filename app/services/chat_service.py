@@ -22,6 +22,16 @@ def _build_provider() -> LLMProvider:
 _LOOP = AgentLoop(_build_provider())
 
 
+# 验收专用的总纲覆盖:影子跑分时要看"这批候选样本重新归纳后的总纲"会带来什么后果,
+# 但不能真把没验证的总纲写进 settings。用进程内变量临时顶替,跑完置空。
+_SUMMARY_OVERRIDE: str | None = None
+
+
+def set_summary_override(text: str | None) -> None:
+    global _SUMMARY_OVERRIDE
+    _SUMMARY_OVERRIDE = text
+
+
 def effective_system_prompt() -> str:
     """完整生效的系统提示词(技术流程 + 业务设定 + 套路总纲),供后台查看与聊天使用。"""
     from . import settings_service
@@ -30,7 +40,8 @@ def effective_system_prompt() -> str:
         "\n\n【业务设定(店长在后台可改,始终优先遵守,为最高铁律)】\n"
         + settings_service.get_directive()
     )
-    summary = settings_service.get_summary().strip()
+    summary = (_SUMMARY_OVERRIDE if _SUMMARY_OVERRIDE is not None
+               else settings_service.get_summary()).strip()
     if summary:
         parts.append(
             "\n\n【套路总纲(店长已确认的应答策略,按此执行;"
@@ -69,7 +80,7 @@ _BASE_PROMPT = (
 )
 
 
-def handle_chat(message: str, session_id: str = "demo") -> LoopResult:
+def handle_chat(message: str, session_id: str = "demo", log_metrics: bool = True) -> LoopResult:
     # system 每轮由 Loop 注入最新的 effective_system_prompt(总纲/业务设定实时生效),
     # 会话存储只保留纯对话轮次。
     history = _SESSIONS.get(session_id, [])
@@ -87,7 +98,9 @@ def handle_chat(message: str, session_id: str = "demo") -> LoopResult:
     ]
     _SESSIONS[session_id] = full_history[-config.SESSION_MAX_MESSAGES:]
 
-    _log_metrics(session_id, message, result)
+    # 验收跑分不算真实经营流量,不写 metrics_log,避免污染转人工率/命中率
+    if log_metrics:
+        _log_metrics(session_id, message, result)
     return result
 
 

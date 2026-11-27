@@ -40,7 +40,8 @@ def metrics() -> dict[str, Any]:
         handoff = cur.fetchone()["c"]
         cur.execute("SELECT COUNT(*) AS c FROM metrics_log WHERE hit_kb=1")
         hit = cur.fetchone()["c"]
-    kb_count = playbook_service.count()
+    # 只数已生效的:待验证样本还没参与召回,不该算进「知识库容量」
+    kb_count = playbook_service.count_active()
     return {
         "kb_count": kb_count,
         "total_chats": total,

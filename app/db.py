@@ -67,9 +67,12 @@ def init_db() -> None:
                 question TEXT NOT NULL,                 -- 客户问题(示范)
                 answer TEXT NOT NULL,                   -- 标准答案/话术
                 note TEXT,                              -- 这么答的原因/套路
-                source TEXT NOT NULL DEFAULT 'taught',  -- taught(对话教) | ticket(工单补充)
+                source TEXT NOT NULL DEFAULT 'taught',  -- taught(对话教) | ticket(工单补充) | refine(纠偏)
                 vector TEXT,                            -- 问题的向量(JSON list[float]),供 top-k 语义检索
                 vec_model TEXT,                         -- 生成该向量的后端签名,后端切换时据此重算
+                status TEXT NOT NULL DEFAULT 'active',  -- active(已生效,可被召回) | pending(待验证) | rolled_back(已回滚)
+                batch_id TEXT,                          -- 学习批次号,回滚以批次为单位整体撤销
+                activated_at TEXT,                      -- 通过验证、正式生效的时间
                 created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
             )
             """
@@ -80,6 +83,15 @@ def init_db() -> None:
             cur.execute("ALTER TABLE playbook ADD COLUMN vector TEXT")
         if "vec_model" not in existing_cols:
             cur.execute("ALTER TABLE playbook ADD COLUMN vec_model TEXT")
+        # 兼容旧库:双闸(待生效→店长确认)与批次回滚所需的三列。
+        # 老数据一律视为 active,保证升级后线上行为不变。
+        if "status" not in existing_cols:
+            cur.execute("ALTER TABLE playbook ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+        if "batch_id" not in existing_cols:
+            cur.execute("ALTER TABLE playbook ADD COLUMN batch_id TEXT")
+        if "activated_at" not in existing_cols:
+            cur.execute("ALTER TABLE playbook ADD COLUMN activated_at TEXT")
+            cur.execute("UPDATE playbook SET activated_at=created_at WHERE status='active'")
         # 兼容旧库:早期「实测纠偏」样本混存为 source='taught'(仅靠 note 前缀区分),
         # 迁移为独立的 source='refine',使教学套路与纠错数据可分开管理与展示。
         cur.execute(
@@ -102,6 +114,24 @@ def init_db() -> None:
                 question TEXT,
                 hit_kb INTEGER NOT NULL DEFAULT 0,
                 handoff INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+            )
+            """
+        )
+        # 验收台账:每次跑评估集留一行,作为「学了之后有没有变坏」的可追溯凭证。
+        # verdict:baseline(首跑基线) / pass(不低于基线) / regress(退步超阈值)。
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS eval_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id TEXT,                            -- 本次评测针对的学习批次
+                n_cases INTEGER NOT NULL,                 -- 题目总数
+                passed INTEGER NOT NULL,                  -- 全项通过的题数
+                score REAL NOT NULL,                      -- 综合分 0~1
+                metrics TEXT,                             -- JSON:各项分指标
+                verdict TEXT NOT NULL DEFAULT 'baseline', -- baseline | pass | regress
+                delta REAL,                               -- 与上一轮相比的综合分变化
+                note TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
             )
             """

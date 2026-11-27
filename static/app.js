@@ -389,6 +389,7 @@ $("#save-directive").addEventListener("click", async () => {
 // ---------- 后台:工单 + 套路库管理 ----------
 async function loadReview() {
   loadDirective();
+  loadEval();
   // 工单
   const tickets = await api("/api/tickets?status=open");
   const tbox = $("#tickets");
@@ -466,5 +467,90 @@ function renderSampleCard(s) {
   };
   return c;
 }
+
+// ---------- 自学习验收:待验证 / 台账 / 回滚 ----------
+async function loadEval() {
+  const [pending, runs, batches] = await Promise.all([
+    api("/api/learn/pending"),
+    api("/api/eval/history?limit=5"),
+    api("/api/learn/batches"),
+  ]);
+
+  const activeBatches = (batches || []).filter((b) => b.status === "active" && b.batch_id);
+  $("#eval-summary").innerHTML =
+    `待验证 <b>${pending.length}</b> 条 · 历史跑分 <b>${runs.length}</b> 次` +
+    (activeBatches.length ? ` · 已生效批次 ${activeBatches.length} 个` : "");
+
+  // 待验证样本:可按批次整批转正或回滚
+  const pbox = $("#eval-pending");
+  if (!pending.length) {
+    pbox.innerHTML = '<div class="empty">没有待验证样本。自学习产出会先进这里,验过才生效。</div>';
+  } else {
+    pbox.innerHTML = "";
+    const byBatch = {};
+    pending.forEach((s) => { (byBatch[s.batch_id || "-"] ||= []).push(s); });
+    Object.entries(byBatch).forEach(([bid, items]) => {
+      const c = document.createElement("div");
+      c.className = "card";
+      c.innerHTML = `
+        <div class="q">批次 ${escapeHtml(bid)} · ${items.length} 条待验证</div>
+        <div class="meta">${escapeHtml(items[0].question)} …</div>
+        <div class="actions">
+          <button class="btn-ok">整批转正</button>
+          <button class="btn-reject">整批回滚</button>
+        </div>`;
+      const [ok, no] = c.querySelectorAll("button");
+      ok.onclick = async () => {
+        ok.disabled = true;
+        await post(`/api/learn/batch/${encodeURIComponent(bid)}/activate`, {});
+        loadEval(); refreshMetrics();
+      };
+      no.onclick = async () => {
+        if (!confirm("回滚该批次?样本会立即从召回中消失(数据保留)。")) return;
+        await post(`/api/learn/batch/${encodeURIComponent(bid)}/rollback`, {});
+        loadEval(); refreshMetrics();
+      };
+      pbox.appendChild(c);
+    });
+  }
+
+  // 台账:最近几次跑分的分数与结论
+  const h = $("#eval-history");
+  if (!runs.length) {
+    h.innerHTML = '<div class="empty">还没有跑分记录,点下面按钮跑第一次。</div>';
+    return;
+  }
+  h.innerHTML = `<table style="width:100%;font-size:12px;border-collapse:collapse">
+    <tr style="opacity:.6;text-align:left">
+      <th>#</th><th>时间</th><th>分数</th><th>通过</th><th>结论</th><th>批次</th></tr>
+    ${runs.map((r) => `<tr>
+      <td>${r.id}</td><td>${escapeHtml((r.created_at || "").slice(5, 16))}</td>
+      <td>${r.score.toFixed(3)}</td><td>${r.passed}/${r.n_cases}</td>
+      <td style="color:${r.verdict === "regress" ? "#c0392b" : r.verdict === "pass" ? "#27ae60" : "inherit"}">
+        ${r.verdict === "regress" ? "退步·拒绝" : r.verdict === "pass" ? "通过" : "基线"}</td>
+      <td>${escapeHtml(r.batch_id || "-")}</td></tr>`).join("")}
+  </table>`;
+}
+
+$("#eval-run").addEventListener("click", async () => {
+  const btn = $("#eval-run");
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = "跑分中…(约 1 分钟)";
+  try {
+    const res = await post("/api/eval/run", {});
+    btn.textContent = old;
+    btn.disabled = false;
+    if (res && res.verdict) {
+      alert(`综合分 ${res.score} · 通过 ${res.passed}/${res.n_cases} · ${
+        res.verdict === "regress" ? "退步!已拒绝生效" : "通过"}`);
+    }
+    loadEval();
+  } catch (e) {
+    btn.textContent = old;
+    btn.disabled = false;
+    alert("跑分失败:" + e);
+  }
+});
 
 refreshMetrics();
